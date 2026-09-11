@@ -1,881 +1,1530 @@
 "use client";
 
-import { useCallback, useEffect, useRef, useState } from "react";
-import Link from "next/link";
+import {
+  ChangeEvent,
+  FormEvent,
+  useEffect,
+  useMemo,
+  useState,
+} from "react";
+import { supabase } from "@/lib/supabase";
+import { categories, interests, type Interest } from "@/data/interests";
 
-import Header from "@/components/Header";
-
-const API = {
-  discover: "/api/profiles/discover",
-};
-
-const INTRO_STORAGE_KEY = "myfolks_discovery_intro_seen";
-
-type Profile = {
+type Person = {
   id: string;
   name: string;
-  username: string;
-  featuredInterest: string;
-  bio: string;
-  initials: string;
-  allowsMessages: boolean;
+  bio: string | null;
+  interests: string[];
+  categories: string[];
+  profileImage: string | null;
+  whatsapp: string | null;
+  facebook: string | null;
 };
 
-type DiscoverResponse = {
-  success?: boolean;
-  anchor?: Profile | null;
-  challenger?: Profile | null;
-  exhausted?: boolean;
-  error?: string;
+type DiscoveryRound = {
+  left: Person;
+  right: Person;
 };
 
-type DiscoveryAction = "selected" | "skipped";
+type DiscoveryChoice = {
+  winnerId: string;
+  loserId: string;
+};
 
-type PageState =
-  | "loading"
-  | "ready"
-  | "exhausted"
-  | "unauthenticated"
-  | "error";
+const INTRO_SESSION_KEY = "myfolks-intro-completed";
+const PROFILE_SESSION_KEY = "myfolks-profile-id";
+const TOTAL_ROUNDS = 6;
 
-function getInitials(name: string) {
-  const words = name.trim().split(/\s+/).filter(Boolean);
-
-  if (words.length === 0) return "?";
-
-  if (words.length === 1) {
-    return words[0].slice(0, 2).toUpperCase();
-  }
-
-  return `${words[0][0]}${words[words.length - 1][0]}`.toUpperCase();
+function initials(name: string) {
+  return name
+    .trim()
+    .split(/\s+/)
+    .slice(0, 2)
+    .map((part) => part.charAt(0).toUpperCase())
+    .join("");
 }
 
-function normalizeProfile(profile: Profile | null | undefined): Profile | null {
-  if (!profile) return null;
-
+function normalizePerson(row: any): Person {
   return {
-    ...profile,
-    initials:
-      profile.initials ||
-      getInitials(profile.name || profile.username || "?"),
-    bio: profile.bio || "",
-    featuredInterest: profile.featuredInterest || "",
-    allowsMessages:
-      typeof profile.allowsMessages === "boolean"
-        ? profile.allowsMessages
-        : true,
+    id: row.id,
+    name: row.name ?? "",
+    bio: row.bio ?? null,
+    interests: Array.isArray(row.interests)
+      ? row.interests
+      : [],
+    categories: Array.isArray(row.categories)
+      ? row.categories
+      : [],
+    profileImage: row.profile_image ?? null,
+    whatsapp: row.whatsapp ?? null,
+    facebook: row.facebook ?? null,
   };
 }
 
-function ProfileCard({
-  profile,
-  side,
-  leaving,
-  incoming,
-  disabled,
-  onSelect,
-  onReport,
-  onBlock,
+function getCategories(person: Person) {
+  const values = new Set(person.categories);
+
+  person.interests.forEach((interest) => {
+    const category = categories[interest as Interest];
+
+    if (category) {
+      values.add(category);
+    }
+  });
+
+  return Array.from(values);
+}
+
+function normalizeWhatsAppNumber(value: string) {
+  const digits = value.replace(/\D/g, "");
+
+  if (digits.startsWith("94")) {
+    return digits;
+  }
+
+  if (digits.startsWith("0")) {
+    return `94${digits.slice(1)}`;
+  }
+
+  return digits;
+}
+
+function isValidWhatsAppNumber(value: string) {
+  return /^94(7\d{8})$/.test(
+    normalizeWhatsAppNumber(value),
+  );
+}
+
+function createWhatsAppLink(
+  phoneNumber: string | null,
+  matchedPersonName: string,
+) {
+  if (
+    !phoneNumber ||
+    !isValidWhatsAppNumber(phoneNumber)
+  ) {
+    return null;
+  }
+
+  const normalized =
+    normalizeWhatsAppNumber(phoneNumber);
+
+  const message =
+    `Hey ${matchedPersonName}! ` +
+    `We found some common ground on myFolks.`;
+
+  return `https://wa.me/${normalized}?text=${encodeURIComponent(
+    message,
+  )}`;
+}
+
+function findCommonGround(
+  currentUser: Person,
+  people: Person[],
+  choices: DiscoveryChoice[],
+) {
+  const selectedPeople = choices
+    .map((choice) =>
+      people.find(
+        (person) =>
+          person.id === choice.winnerId,
+      ),
+    )
+    .filter(
+      (person): person is Person =>
+        Boolean(person),
+    );
+
+  if (!selectedPeople.length) {
+    return null;
+  }
+
+  const userInterests = new Set(
+    currentUser.interests.map((interest) =>
+      interest.toLowerCase(),
+    ),
+  );
+
+  const userCategories = new Set(
+    getCategories(currentUser).map((category) =>
+      category.toLowerCase(),
+    ),
+  );
+
+  const scored = selectedPeople.map((person) => {
+    const sharedInterests =
+      person.interests.filter((interest) =>
+        userInterests.has(
+          interest.toLowerCase(),
+        ),
+      );
+
+    const sharedCategories =
+      getCategories(person).filter((category) =>
+        userCategories.has(
+          category.toLowerCase(),
+        ),
+      );
+
+    const choiceCount = choices.filter(
+      (choice) =>
+        choice.winnerId === person.id,
+    ).length;
+
+    const score =
+      sharedInterests.length * 5 +
+      sharedCategories.length * 2 +
+      choiceCount * 3;
+
+    return {
+      person,
+      sharedInterests,
+      sharedCategories,
+      choiceCount,
+      score,
+    };
+  });
+
+  scored.sort(
+    (a, b) => b.score - a.score,
+  );
+
+  return scored[0] ?? null;
+}
+
+function PersonAvatar({
+  person,
+  large = false,
 }: {
-  profile: Profile;
-  side: "anchor" | "challenger";
-  leaving: boolean;
-  incoming: boolean;
-  disabled: boolean;
-  onSelect: () => void;
-  onReport: () => void;
-  onBlock: () => void;
+  person: Person;
+  large?: boolean;
 }) {
-  const isAnchor = side === "anchor";
+  if (person.profileImage) {
+    return (
+      <img
+        src={person.profileImage}
+        alt={person.name}
+        className={`avatar ${
+          large ? "avatar-large" : ""
+        }`}
+      />
+    );
+  }
 
   return (
-    <article
-      className={[
-        "group relative overflow-hidden rounded-[30px] border border-[var(--line)] bg-[var(--paper)]",
-        "shadow-[0_18px_45px_rgba(37,33,31,0.075)]",
-        "transition-all duration-[260ms]",
-        "[transition-timing-function:cubic-bezier(0.22,1,0.36,1)]",
-        leaving
-          ? isAnchor
-            ? "-translate-x-8 opacity-0"
-            : "translate-x-8 opacity-0"
-          : "",
-        incoming ? "animate-card-in" : "",
-        disabled ? "pointer-events-none" : "",
-      ].join(" ")}
+    <div
+      className={`avatar ${
+        large ? "avatar-large" : ""
+      }`}
+      aria-label={`${person.name} profile`}
     >
-      <div className="p-6 sm:p-7">
-        <div className="mb-7 flex items-start justify-between gap-4">
-          <div className="flex items-center gap-3.5">
-            <div className="flex h-14 w-14 shrink-0 items-center justify-center rounded-[18px] bg-[var(--lavender)] text-sm font-extrabold tracking-[-0.02em] text-[var(--ink)] shadow-[inset_0_0_0_1px_rgba(37,33,31,0.04)]">
-              {profile.initials}
-            </div>
+      {initials(person.name)}
+    </div>
+  );
+}
 
-            <div className="min-w-0">
-              <p className="text-xs font-bold uppercase tracking-[0.14em] text-[var(--muted)]">
-                {isAnchor ? "Your current pick" : "A myFolks profile"}
-              </p>
+function PersonCard({
+  person,
+  onChoose,
+}: {
+  person: Person;
+  onChoose: (person: Person) => void;
+}) {
+  return (
+    <article className="profile-card">
+      <div className="profile-card-top">
+        <PersonAvatar person={person} />
 
-              <h2 className="mt-1 truncate text-xl font-extrabold tracking-[-0.035em] text-[var(--ink)]">
-                {profile.name}
-              </h2>
-
-              <p className="mt-0.5 truncate text-sm text-[var(--muted)]">
-                @{profile.username}
-              </p>
-            </div>
-          </div>
-
-          <div className="shrink-0 rounded-full border border-[var(--line)] bg-[var(--mist)] px-3 py-1.5 text-[11px] font-bold uppercase tracking-[0.1em] text-[var(--muted)]">
-            {isAnchor ? "Stays" : "New"}
-          </div>
-        </div>
-
-        <div className="rounded-[24px] bg-[var(--mist)] p-5">
-          <p className="text-xs font-bold uppercase tracking-[0.14em] text-[var(--coral)]">
-            Featured interest
-          </p>
-
-          <p className="mt-3 text-[20px] font-bold leading-8 tracking-[-0.025em] text-[var(--ink)]">
-            {profile.featuredInterest}
-          </p>
-        </div>
-
-        {profile.bio && (
-          <p className="mt-5 text-[15px] leading-7 text-[var(--muted)]">
-            {profile.bio}
-          </p>
-        )}
-
-        <button
-          type="button"
-          disabled={disabled}
-          onClick={onSelect}
-          className="mt-6 w-full rounded-2xl bg-[var(--ink)] px-5 py-3.5 text-sm font-bold text-[var(--paper)] shadow-[0_8px_20px_rgba(37,33,31,0.10)] transition-all duration-300 hover:-translate-y-0.5 hover:shadow-[0_12px_28px_rgba(37,33,31,0.15)] disabled:cursor-not-allowed disabled:opacity-60"
-        >
-          I relate to this
-        </button>
-
-        <div className="mt-4 flex items-center justify-center gap-5">
-          {isAnchor && (
-            <>
-              <button
-                type="button"
-                disabled={disabled}
-                className="text-xs font-semibold text-[var(--muted)] transition-colors duration-300 hover:text-[var(--ink)] disabled:opacity-50"
-                onClick={() => {
-                  // Messaging will be connected to the real messaging flow.
-                }}
-              >
-                {profile.allowsMessages ? "Message" : "Messages off"}
-              </button>
-
-              <span className="h-1 w-1 rounded-full bg-[var(--line)]" />
-
-              <button
-                type="button"
-                disabled={disabled}
-                className="text-xs font-semibold text-[var(--muted)] transition-colors duration-300 hover:text-[var(--ink)] disabled:opacity-50"
-                onClick={() => {
-                  // Friend requests will be connected to the real friends flow.
-                }}
-              >
-                Add friend
-              </button>
-            </>
-          )}
-        </div>
-
-        <div className="mt-6 flex items-center justify-center gap-5 border-t border-[var(--line)] pt-4">
-          <button
-            type="button"
-            disabled={disabled}
-            onClick={onReport}
-            className="text-xs font-medium text-[var(--muted)] transition-colors duration-300 hover:text-[var(--danger)] disabled:opacity-50"
-          >
-            Report
-          </button>
-
-          <span className="h-1 w-1 rounded-full bg-[var(--line)]" />
-
-          <button
-            type="button"
-            disabled={disabled}
-            onClick={onBlock}
-            className="text-xs font-medium text-[var(--muted)] transition-colors duration-300 hover:text-[var(--danger)] disabled:opacity-50"
-          >
-            Block
-          </button>
+        <div className="profile-card-identity">
+          <h3>{person.name}</h3>
+          <span>myFolks member</span>
         </div>
       </div>
+
+      {person.bio && (
+        <p className="profile-card-bio">
+          {person.bio}
+        </p>
+      )}
+
+      <div className="featured-interest">
+        <span>INTEREST</span>
+
+        <strong>
+          {person.interests[0] ??
+            "Something worth discovering"}
+        </strong>
+      </div>
+
+      <button
+        type="button"
+        className="primary-button full-width"
+        onClick={() => onChoose(person)}
+      >
+        I relate to this
+      </button>
     </article>
   );
 }
 
-function LoadingState() {
-  return (
-    <div className="py-16 text-center animate-fade-up">
-      <div className="mx-auto mb-6 flex h-16 w-16 items-center justify-center rounded-[22px] bg-[var(--lavender)]">
-        <div className="h-6 w-6 animate-spin rounded-full border-2 border-[var(--line)] border-t-[var(--ink)]" />
-      </div>
-
-      <p className="text-xs font-bold uppercase tracking-[0.16em] text-[var(--coral)]">
-        Discover
-      </p>
-
-      <h2 className="mt-3 text-2xl font-extrabold tracking-[-0.04em] text-[var(--ink)] sm:text-3xl">
-        Finding people you might connect with…
-      </h2>
-
-      <p className="mx-auto mt-3 max-w-[430px] text-sm leading-6 text-[var(--muted)]">
-        We&apos;re looking for public profiles with interests you can discover
-        together.
-      </p>
-    </div>
-  );
-}
-
-function ExhaustedState({
-  onRefresh,
-  onCreateProfile,
-}: {
-  onRefresh: () => void;
-  onCreateProfile: () => void;
-}) {
-  return (
-    <div className="py-14 text-center animate-page-in">
-      <div className="mx-auto mb-6 flex h-16 w-16 items-center justify-center rounded-[22px] bg-[var(--lavender)] text-xl font-extrabold text-[var(--ink)]">
-        +
-      </div>
-
-      <p className="text-xs font-bold uppercase tracking-[0.16em] text-[var(--coral)]">
-        Growing the community
-      </p>
-
-      <h2 className="mx-auto mt-3 max-w-[600px] text-[clamp(2rem,5vw,3.2rem)] font-extrabold leading-[1] tracking-[-0.055em] text-[var(--ink)]">
-        More people are needed.
-      </h2>
-
-      <p className="mx-auto mt-5 max-w-[500px] text-[15px] leading-7 text-[var(--muted)]">
-        There aren&apos;t enough public profiles available yet to start a
-        discovery comparison. As more people join myFolks, you&apos;ll be able
-        to keep discovering common ground.
-      </p>
-
-      <div className="mt-8 flex flex-col items-center justify-center gap-3 sm:flex-row">
-        <button
-          type="button"
-          onClick={onRefresh}
-          className="rounded-2xl bg-[var(--ink)] px-5 py-3.5 text-sm font-bold text-[var(--paper)] shadow-[0_8px_20px_rgba(37,33,31,0.10)] transition-all duration-300 hover:-translate-y-0.5 hover:shadow-[0_12px_28px_rgba(37,33,31,0.15)]"
-        >
-          Refresh discovery
-        </button>
-
-        <button
-          type="button"
-          onClick={onCreateProfile}
-          className="rounded-2xl border border-[var(--line)] bg-[var(--paper)] px-5 py-3.5 text-sm font-bold text-[var(--ink)] transition-all duration-300 hover:-translate-y-0.5 hover:bg-[var(--mist)]"
-        >
-          Invite people
-        </button>
-      </div>
-
-      <p className="mx-auto mt-6 max-w-[430px] text-xs leading-5 text-[#938a83]">
-        You don&apos;t need to add anything else to your own profile. This
-        message simply means there aren&apos;t enough other eligible profiles
-        yet.
-      </p>
-    </div>
-  );
-}
-
-function UnauthenticatedState() {
-  return (
-    <div className="py-14 text-center animate-page-in">
-      <p className="text-xs font-bold uppercase tracking-[0.16em] text-[var(--coral)]">
-        Welcome to myFolks
-      </p>
-
-      <h2 className="mx-auto mt-3 max-w-[600px] text-[clamp(2rem,5vw,3.2rem)] font-extrabold leading-[1] tracking-[-0.055em] text-[var(--ink)]">
-        Sign in to discover your people.
-      </h2>
-
-      <p className="mx-auto mt-5 max-w-[500px] text-[15px] leading-7 text-[var(--muted)]">
-        Create an account or sign in to start finding common ground through
-        shared interests.
-      </p>
-
-      <div className="mt-8 flex flex-col items-center justify-center gap-3 sm:flex-row">
-        <Link
-          href="/login"
-          className="rounded-2xl bg-[var(--ink)] px-5 py-3.5 text-sm font-bold text-[var(--paper)] shadow-[0_8px_20px_rgba(37,33,31,0.10)] transition-all duration-300 hover:-translate-y-0.5 hover:shadow-[0_12px_28px_rgba(37,33,31,0.15)]"
-        >
-          Sign in
-        </Link>
-
-        <Link
-          href="/signup"
-          className="rounded-2xl border border-[var(--line)] bg-[var(--paper)] px-5 py-3.5 text-sm font-bold text-[var(--ink)] transition-all duration-300 hover:-translate-y-0.5 hover:bg-[var(--mist)]"
-        >
-          Create account
-        </Link>
-      </div>
-    </div>
-  );
-}
-
-function ErrorState({ onRetry }: { onRetry: () => void }) {
-  return (
-    <div className="py-14 text-center animate-page-in">
-      <p className="text-xs font-bold uppercase tracking-[0.16em] text-[var(--danger)]">
-        Something went wrong
-      </p>
-
-      <h2 className="mx-auto mt-3 max-w-[600px] text-[clamp(2rem,5vw,3.2rem)] font-extrabold leading-[1] tracking-[-0.055em] text-[var(--ink)]">
-        We couldn&apos;t load Discover.
-      </h2>
-
-      <p className="mx-auto mt-5 max-w-[500px] text-[15px] leading-7 text-[var(--muted)]">
-        Your profile is safe. Try loading discovery again.
-      </p>
-
-      <button
-        type="button"
-        onClick={onRetry}
-        className="mt-8 rounded-2xl bg-[var(--ink)] px-5 py-3.5 text-sm font-bold text-[var(--paper)] shadow-[0_8px_20px_rgba(37,33,31,0.10)] transition-all duration-300 hover:-translate-y-0.5 hover:shadow-[0_12px_28px_rgba(37,33,31,0.15)]"
-      >
-        Try again
-      </button>
-    </div>
-  );
-}
-
 export default function HomePage() {
-  const [activePage, setActivePage] = useState("discover");
+  const [introReady, setIntroReady] =
+    useState(false);
 
-  const [pageState, setPageState] = useState<PageState>("loading");
+  const [started, setStarted] =
+    useState(false);
 
-  const [anchor, setAnchor] = useState<Profile | null>(null);
-  const [challenger, setChallenger] = useState<Profile | null>(null);
+  const [people, setPeople] =
+    useState<Person[]>([]);
 
-  const [comparisonCount, setComparisonCount] = useState(0);
+  const [currentUser, setCurrentUser] =
+    useState<Person | null>(null);
 
-  const [leavingProfileId, setLeavingProfileId] = useState<string | null>(
-    null
-  );
-  const [incomingProfileId, setIncomingProfileId] = useState<string | null>(
-    null
-  );
+  const [activeView, setActiveView] =
+    useState<"discover" | "profile">(
+      "discover",
+    );
 
-  const [actionInProgress, setActionInProgress] = useState(false);
+  const [loadingProfiles, setLoadingProfiles] =
+    useState(true);
 
-  const [showIntro, setShowIntro] = useState(false);
-  const [notice, setNotice] = useState("");
+  const [savingProfile, setSavingProfile] =
+    useState(false);
 
-  const actionTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const [profileError, setProfileError] =
+    useState("");
 
-  const loadDiscovery = useCallback(async () => {
-    if (actionTimerRef.current) {
-      clearTimeout(actionTimerRef.current);
-      actionTimerRef.current = null;
+  const [discoveryError, setDiscoveryError] =
+    useState("");
+
+  const [round, setRound] =
+    useState(0);
+
+  const [rounds, setRounds] =
+    useState<DiscoveryRound[]>([]);
+
+  const [choices, setChoices] =
+    useState<DiscoveryChoice[]>([]);
+
+  const [result, setResult] =
+    useState<
+      ReturnType<typeof findCommonGround>
+    >(null);
+
+  const [profileForm, setProfileForm] =
+    useState({
+      name: "",
+      bio: "",
+      whatsapp: "",
+      facebook: "",
+      interests: [] as string[],
+      profileImage: "",
+    });
+
+  const currentRound =
+    rounds[round];
+
+  const progress =
+    round >= TOTAL_ROUNDS
+      ? 100
+      : (round / TOTAL_ROUNDS) * 100;
+
+  const whatsappLink = useMemo(() => {
+    if (!result?.person.whatsapp) {
+      return null;
     }
 
-    setPageState("loading");
-    setNotice("");
-    setLeavingProfileId(null);
-    setIncomingProfileId(null);
+    return createWhatsAppLink(
+      result.person.whatsapp,
+      result.person.name,
+    );
+  }, [result]);
 
-    try {
-      const response = await fetch(API.discover, {
-        method: "GET",
-        cache: "no-store",
-        credentials: "include",
-      });
+  useEffect(() => {
+    const completed =
+      window.sessionStorage.getItem(
+        INTRO_SESSION_KEY,
+      ) === "true";
 
-      let data: DiscoverResponse = {};
-
-      try {
-        data = await response.json();
-      } catch {
-        data = {};
-      }
-
-      if (response.status === 401) {
-        setAnchor(null);
-        setChallenger(null);
-        setPageState("unauthenticated");
-        return;
-      }
-
-      if (!response.ok) {
-        throw new Error(
-          data.error || "Unable to load discovery right now."
-        );
-      }
-
-      const nextAnchor = normalizeProfile(data.anchor);
-      const nextChallenger = normalizeProfile(data.challenger);
-
-      /*
-       * This is the important fix.
-       *
-       * The API can legitimately return:
-       *
-       * success: true
-       * anchor: null
-       * challenger: null
-       * exhausted: true
-       *
-       * when there are not enough eligible profiles.
-       *
-       * That is NOT a loading state.
-       */
-      if (data.exhausted || !nextAnchor || !nextChallenger) {
-        setAnchor(null);
-        setChallenger(null);
-        setPageState("exhausted");
-        return;
-      }
-
-      setAnchor(nextAnchor);
-      setChallenger(nextChallenger);
-      setPageState("ready");
-    } catch (error) {
-      console.error("Discover loading error:", error);
-
-      setAnchor(null);
-      setChallenger(null);
-      setPageState("error");
+    if (completed) {
+      setStarted(true);
     }
+
+    setIntroReady(true);
   }, []);
 
   useEffect(() => {
-    const introSeen =
-      window.localStorage.getItem(INTRO_STORAGE_KEY) === "true";
-
-    if (!introSeen) {
-      setShowIntro(true);
+    if (!introReady) {
+      return;
     }
 
-    void loadDiscovery();
+    loadProfiles();
+  }, [introReady]);
 
-    return () => {
-      if (actionTimerRef.current) {
-        clearTimeout(actionTimerRef.current);
+  async function loadProfiles() {
+    setLoadingProfiles(true);
+    setDiscoveryError("");
+
+    const { data, error } =
+      await supabase
+        .from("people")
+        .select(
+          "id,name,bio,interests,categories,profile_image,whatsapp,facebook",
+        )
+        .order("created_at", {
+          ascending: true,
+        });
+
+    if (error) {
+      console.error(error);
+
+      setDiscoveryError(
+        "We couldn't load your folks right now.",
+      );
+
+      setLoadingProfiles(false);
+      return;
+    }
+
+    const normalized =
+      (data ?? []).map(
+        normalizePerson,
+      );
+
+    setPeople(normalized);
+
+    const storedProfileId =
+      window.sessionStorage.getItem(
+        PROFILE_SESSION_KEY,
+      );
+
+    if (storedProfileId) {
+      const existing =
+        normalized.find(
+          (person) =>
+            person.id ===
+            storedProfileId,
+        );
+
+      if (existing) {
+        setCurrentUser(existing);
+
+        setProfileForm({
+          name: existing.name,
+          bio: existing.bio ?? "",
+          whatsapp:
+            existing.whatsapp ?? "",
+          facebook:
+            existing.facebook ?? "",
+          interests:
+            existing.interests,
+          profileImage:
+            existing.profileImage ?? "",
+        });
       }
-    };
-  }, [loadDiscovery]);
+    }
 
-  function closeIntro() {
-    window.localStorage.setItem(INTRO_STORAGE_KEY, "true");
-    setShowIntro(false);
+    setLoadingProfiles(false);
   }
 
-  const handleDiscoveryAction = async (
-    selectedProfile: Profile,
-    action: DiscoveryAction
-  ) => {
+  function startExperience() {
+    window.sessionStorage.setItem(
+      INTRO_SESSION_KEY,
+      "true",
+    );
+
+    setStarted(true);
+  }
+
+  function generateRounds(
+    profileList: Person[],
+    user: Person,
+  ) {
+    const candidates =
+      profileList.filter(
+        (person) =>
+          person.id !== user.id,
+      );
+
+    if (candidates.length < 2) {
+      return [];
+    }
+
+    const shuffled = [...candidates].sort(
+      () => Math.random() - 0.5,
+    );
+
+    const generated: DiscoveryRound[] =
+      [];
+
+    for (
+      let index = 0;
+      index < TOTAL_ROUNDS;
+      index++
+    ) {
+      const left =
+        shuffled[
+          index % shuffled.length
+        ];
+
+      let right =
+        shuffled[
+          (index + 1) %
+            shuffled.length
+        ];
+
+      if (right.id === left.id) {
+        right =
+          shuffled[
+            (index + 2) %
+              shuffled.length
+          ];
+      }
+
+      generated.push({
+        left,
+        right,
+      });
+    }
+
+    return generated;
+  }
+
+  function beginDiscovery(
+    user: Person,
+  ) {
+    const generated =
+      generateRounds(
+        people,
+        user,
+      );
+
     if (
-      actionInProgress ||
-      pageState !== "ready" ||
-      !anchor ||
-      !challenger
+      generated.length <
+      TOTAL_ROUNDS
+    ) {
+      setDiscoveryError(
+        "At least two other people need to create profiles before discovery can begin.",
+      );
+      return;
+    }
+
+    setDiscoveryError("");
+    setChoices([]);
+    setResult(null);
+    setRound(0);
+    setRounds(generated);
+    setActiveView("discover");
+  }
+
+  function choosePerson(
+    selected: Person,
+  ) {
+    if (
+      !currentRound ||
+      !currentUser
     ) {
       return;
     }
 
-    setActionInProgress(true);
-    setNotice("");
+    const other =
+      selected.id ===
+      currentRound.left.id
+        ? currentRound.right
+        : currentRound.left;
 
-    /*
-     * The selected profile becomes the new anchor only when the challenger
-     * is selected.
-     *
-     * Selecting the current anchor keeps the anchor in place.
-     * Skipping also keeps the anchor in place.
-     */
-    const nextAnchor =
-      action === "selected" && selectedProfile.id === challenger.id
-        ? challenger
-        : anchor;
+    const choice: DiscoveryChoice =
+      {
+        winnerId: selected.id,
+        loserId: other.id,
+      };
 
-    const oldChallenger = challenger;
+    const updatedChoices = [
+      ...choices,
+      choice,
+    ];
 
-    setLeavingProfileId(oldChallenger.id);
+    setChoices(updatedChoices);
 
-    try {
-      const response = await fetch(API.discover, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-        },
-        credentials: "include",
-        body: JSON.stringify({
-          anchorProfileId: anchor.id,
-          challengerProfileId: challenger.id,
-          selectedProfileId:
-            action === "selected" ? selectedProfile.id : null,
-          action,
-        }),
-      });
-
-      let data: DiscoverResponse = {};
-
-      try {
-        data = await response.json();
-      } catch {
-        data = {};
-      }
-
-      if (response.status === 401) {
-        setAnchor(null);
-        setChallenger(null);
-        setPageState("unauthenticated");
-        return;
-      }
-
-      if (!response.ok) {
-        throw new Error(
-          data.error || "Unable to continue discovery right now."
+    if (
+      updatedChoices.length ===
+      TOTAL_ROUNDS
+    ) {
+      const commonGround =
+        findCommonGround(
+          currentUser,
+          people,
+          updatedChoices,
         );
-      }
 
-      setComparisonCount((count) => count + 1);
-
-      /*
-       * Give the outgoing challenger enough time to leave before inserting
-       * the next challenger. The anchor remains visually stable.
-       */
-      await new Promise<void>((resolve) => {
-        actionTimerRef.current = setTimeout(resolve, 260);
-      });
-
-      const responseAnchor = normalizeProfile(data.anchor);
-      const responseChallenger = normalizeProfile(data.challenger);
-
-      if (data.exhausted || !responseAnchor || !responseChallenger) {
-        setAnchor(responseAnchor || nextAnchor);
-        setChallenger(null);
-        setLeavingProfileId(null);
-        setIncomingProfileId(null);
-        setPageState("exhausted");
-        return;
-      }
-
-      setAnchor(responseAnchor || nextAnchor);
-      setChallenger(responseChallenger);
-
-      setLeavingProfileId(null);
-      setIncomingProfileId(responseChallenger.id);
-
-      setPageState("ready");
-
-      actionTimerRef.current = setTimeout(() => {
-        setIncomingProfileId(null);
-        actionTimerRef.current = null;
-      }, 650);
-    } catch (error) {
-      console.error("Discovery action error:", error);
-
-      setLeavingProfileId(null);
-      setIncomingProfileId(null);
-
-      setNotice(
-        error instanceof Error
-          ? error.message
-          : "Unable to continue discovery."
-      );
-    } finally {
-      setActionInProgress(false);
-    }
-  };
-
-  function handleReport(profile: Profile) {
-    setNotice(
-      `Report flow for @${profile.username} will be connected to the safety system.`
-    );
-  }
-
-  function handleBlock(profile: Profile) {
-    setNotice(
-      `Block flow for @${profile.username} will be connected to the safety system.`
-    );
-  }
-
-  function handleNavigation(page: string) {
-    setActivePage(page);
-
-    if (page === "discover") {
+      setResult(commonGround);
+      setRound(TOTAL_ROUNDS);
       return;
     }
 
-    setNotice(
-      `${page
-        .replace("-", " ")
-        .replace(/\b\w/g, (letter) => letter.toUpperCase())} is ready for the next implementation step.`
+    setRound(
+      (previous) =>
+        previous + 1,
     );
   }
 
-  const renderDiscoveryContent = () => {
-    if (pageState === "loading") {
-      return <LoadingState />;
-    }
+  function updateProfileField(
+    field: keyof typeof profileForm,
+    value: string,
+  ) {
+    setProfileForm(
+      (previous) => ({
+        ...previous,
+        [field]: value,
+      }),
+    );
+  }
 
-    if (pageState === "unauthenticated") {
-      return <UnauthenticatedState />;
-    }
+  function toggleInterest(
+    interest: string,
+  ) {
+    setProfileForm(
+      (previous) => {
+        if (
+          previous.interests.includes(
+            interest,
+          )
+        ) {
+          return {
+            ...previous,
+            interests:
+              previous.interests.filter(
+                (item) =>
+                  item !==
+                  interest,
+              ),
+          };
+        }
 
-    if (pageState === "error") {
-      return <ErrorState onRetry={() => void loadDiscovery()} />;
-    }
+        if (
+          previous.interests
+            .length >= 8
+        ) {
+          return previous;
+        }
 
-    if (pageState === "exhausted") {
-      return (
-        <ExhaustedState
-          onRefresh={() => void loadDiscovery()}
-          onCreateProfile={() => setActivePage("create-profile")}
-        />
+        return {
+          ...previous,
+          interests: [
+            ...previous.interests,
+            interest,
+          ],
+        };
+      },
+    );
+  }
+
+  function handleProfileImage(
+    event: ChangeEvent<HTMLInputElement>,
+  ) {
+    const file =
+      event.target.files?.[0];
+
+    if (!file) return;
+
+    if (
+      !file.type.startsWith(
+        "image/",
+      )
+    ) {
+      setProfileError(
+        "Please choose an image file.",
       );
+      return;
     }
 
-    if (!anchor || !challenger) {
-      return <LoadingState />;
+    if (
+      file.size >
+      2 * 1024 * 1024
+    ) {
+      setProfileError(
+        "Please choose an image smaller than 2 MB.",
+      );
+      return;
     }
 
+    const reader =
+      new FileReader();
+
+    reader.onload = () => {
+      setProfileForm(
+        (previous) => ({
+          ...previous,
+          profileImage:
+            String(
+              reader.result ??
+                "",
+            ),
+        }),
+      );
+    };
+
+    reader.readAsDataURL(file);
+  }
+
+  async function saveProfile(
+    event: FormEvent<HTMLFormElement>,
+  ) {
+    event.preventDefault();
+
+    setProfileError("");
+
+    const name =
+      profileForm.name.trim();
+
+    const bio =
+      profileForm.bio.trim();
+
+    const whatsapp =
+      profileForm.whatsapp.trim();
+
+    const facebook =
+      profileForm.facebook.trim();
+
+    if (!name) {
+      setProfileError(
+        "Please enter your name.",
+      );
+      return;
+    }
+
+    if (!whatsapp) {
+      setProfileError(
+        "Your WhatsApp number is required so your friends can connect with you.",
+      );
+      return;
+    }
+
+    if (
+      !isValidWhatsAppNumber(
+        whatsapp,
+      )
+    ) {
+      setProfileError(
+        "Please enter a valid Sri Lankan WhatsApp number, such as 0771234567.",
+      );
+      return;
+    }
+
+    if (
+      profileForm.interests
+        .length < 2
+    ) {
+      setProfileError(
+        "Please choose at least two interests.",
+      );
+      return;
+    }
+
+    setSavingProfile(true);
+
+    const payload = {
+      name,
+      bio: bio || null,
+      interests:
+        profileForm.interests,
+      categories: Array.from(
+        new Set(
+          profileForm.interests
+            .map(
+              (interest) =>
+                categories[
+                  interest as Interest
+                ],
+            )
+            .filter(Boolean),
+        ),
+      ),
+      profile_image:
+        profileForm.profileImage ||
+        null,
+      whatsapp:
+        normalizeWhatsAppNumber(
+          whatsapp,
+        ),
+      facebook:
+        facebook || null,
+    };
+
+    let savedPerson:
+      | Person
+      | null = null;
+
+    if (currentUser) {
+      const { data, error } =
+        await supabase
+          .from("people")
+          .update(payload)
+          .eq(
+            "id",
+            currentUser.id,
+          )
+          .select(
+            "id,name,bio,interests,categories,profile_image,whatsapp,facebook",
+          )
+          .single();
+
+      if (error) {
+        console.error(error);
+
+        setProfileError(
+          "We couldn't update your profile. Please try again.",
+        );
+
+        setSavingProfile(false);
+        return;
+      }
+
+      savedPerson =
+        normalizePerson(data);
+    } else {
+      const { data, error } =
+        await supabase
+          .from("people")
+          .insert(payload)
+          .select(
+            "id,name,bio,interests,categories,profile_image,whatsapp,facebook",
+          )
+          .single();
+
+      if (error) {
+        console.error(error);
+
+        setProfileError(
+          "We couldn't create your profile. Please try again.",
+        );
+
+        setSavingProfile(false);
+        return;
+      }
+
+      savedPerson =
+        normalizePerson(data);
+    }
+
+    if (!savedPerson) {
+      setProfileError(
+        "Something went wrong while saving your profile.",
+      );
+
+      setSavingProfile(false);
+      return;
+    }
+
+    setCurrentUser(
+      savedPerson,
+    );
+
+    window.sessionStorage.setItem(
+      PROFILE_SESSION_KEY,
+      savedPerson.id,
+    );
+
+    setPeople(
+      (previous) => {
+        const exists =
+          previous.some(
+            (person) =>
+              person.id ===
+              savedPerson!.id,
+          );
+
+        if (exists) {
+          return previous.map(
+            (person) =>
+              person.id ===
+                savedPerson!.id
+                ? savedPerson!
+                : person,
+          );
+        }
+
+        return [
+          ...previous,
+          savedPerson!,
+        ];
+      },
+    );
+
+    setSavingProfile(false);
+
+    beginDiscovery(
+      savedPerson,
+    );
+  }
+
+  function resetDiscovery() {
+    if (!currentUser) {
+      return;
+    }
+
+    beginDiscovery(
+      currentUser,
+    );
+  }
+
+  if (!introReady) {
     return (
-      <>
-        <div className="mb-6 rounded-[24px] border border-[var(--line)] bg-[var(--paper)] px-5 py-4 shadow-[0_10px_30px_rgba(37,33,31,0.045)] sm:px-6">
-          <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
-            <div>
-              <p className="text-xs font-bold uppercase tracking-[0.14em] text-[var(--muted)]">
-                Your discovery session
-              </p>
+      <div className="app-loading">
+        <div className="loading-dot" />
+      </div>
+    );
+  }
 
-              <p className="mt-1 text-sm font-semibold text-[var(--ink)]">
-                {comparisonCount === 0
-                  ? "Your first comparison"
-                  : `${comparisonCount} comparison${
-                      comparisonCount === 1 ? "" : "s"
-                    } made`}
-              </p>
-            </div>
+  if (!started) {
+    return (
+      <main className="intro-screen grain">
+        <div className="intro-glow intro-glow-one" />
+        <div className="intro-glow intro-glow-two" />
 
-            <div className="h-2 w-full overflow-hidden rounded-full bg-[var(--mist)] sm:w-40">
-              <div
-                className="h-full rounded-full bg-[var(--coral)] transition-all duration-500"
-                style={{
-                  width: `${Math.min(
-                    100,
-                    Math.max(12, comparisonCount * 8)
-                  )}%`,
-                }}
-              />
-            </div>
-          </div>
-        </div>
-
-        <div className="mb-8 rounded-[24px] border border-[var(--line)] bg-[var(--lavender)]/60 px-5 py-4 sm:px-6">
-          <div className="flex gap-3">
-            <div className="mt-1 h-2.5 w-2.5 shrink-0 rounded-full bg-[var(--coral)]" />
-
-            <p className="text-sm leading-6 text-[var(--ink)]">
-              Only share what you&apos;re comfortable making public. myFolks
-              never shows private interests, contact details, or exact
-              locations in Discover.
-            </p>
-          </div>
-        </div>
-
-        <div className="grid gap-5 lg:grid-cols-[1fr_auto_1fr] lg:items-stretch">
-          <ProfileCard
-            profile={anchor}
-            side="anchor"
-            leaving={leavingProfileId === anchor.id}
-            incoming={incomingProfileId === anchor.id}
-            disabled={actionInProgress}
-            onSelect={() => void handleDiscoveryAction(anchor, "selected")}
-            onReport={() => handleReport(anchor)}
-            onBlock={() => handleBlock(anchor)}
-          />
-
-          <div className="flex items-center justify-center py-1 lg:py-0">
-            <div className="flex items-center gap-3 lg:flex-col">
-              <div className="h-px w-10 bg-[var(--line)] lg:h-10 lg:w-px" />
-
-              <span className="text-xs font-bold uppercase tracking-[0.16em] text-[#9b928b]">
-                or
-              </span>
-
-              <div className="h-px w-10 bg-[var(--line)] lg:h-10 lg:w-px" />
-            </div>
+        <div className="intro-content">
+          <div className="intro-mark">
+            m
           </div>
 
-          <ProfileCard
-            profile={challenger}
-            side="challenger"
-            leaving={leavingProfileId === challenger.id}
-            incoming={incomingProfileId === challenger.id}
-            disabled={actionInProgress}
-            onSelect={() =>
-              void handleDiscoveryAction(challenger, "selected")
-            }
-            onReport={() => handleReport(challenger)}
-            onBlock={() => handleBlock(challenger)}
-          />
-        </div>
+          <p className="eyebrow">
+            A place for your people
+          </p>
 
-        <div className="mt-7 flex flex-col items-center">
+          <h1>
+            Find your people.
+            <br />
+            Find common ground.
+          </h1>
+
+          <p className="intro-copy">
+            myFolks helps friends
+            discover meaningful common
+            ground through a few simple
+            choices.
+          </p>
+
           <button
             type="button"
-            disabled={actionInProgress}
-            onClick={() => void handleDiscoveryAction(challenger, "skipped")}
-            className="rounded-full border border-[var(--line)] bg-[var(--paper)] px-6 py-3 text-sm font-bold text-[var(--ink)] shadow-[0_6px_18px_rgba(37,33,31,0.04)] transition-all duration-300 hover:-translate-y-0.5 hover:bg-[var(--mist)] hover:shadow-[0_10px_24px_rgba(37,33,31,0.07)] disabled:cursor-not-allowed disabled:opacity-50"
+            className="primary-button intro-button"
+            onClick={
+              startExperience
+            }
           >
-            {actionInProgress ? "Loading next person…" : "Skip"}
+            Discover
           </button>
-
-          <p className="mt-3 text-xs text-[#938a83]">
-            {comparisonCount === 0
-              ? "Choose the person whose interest feels more familiar."
-              : "Your current pick stays while the next person appears."}
-          </p>
-        </div>
-      </>
-    );
-  };
-
-  return (
-    <>
-      <Header activePage={activePage} onNavigate={handleNavigation} />
-
-      <main className="min-h-[calc(100vh-76px)]">
-        <div className="mx-auto max-w-[1180px] px-5 py-10 sm:px-8 sm:py-14">
-          {activePage === "discover" ? (
-            <>
-              <section className="mb-10 animate-page-in">
-                <p className="mb-3 text-xs font-bold uppercase tracking-[0.18em] text-[var(--coral)]">
-                  Shared-interest discovery
-                </p>
-
-                <div className="max-w-[760px]">
-                  <h1 className="text-[clamp(2.7rem,7vw,5rem)] font-extrabold leading-[0.94] tracking-[-0.06em] text-[var(--ink)]">
-                    Which interest feels familiar?
-                  </h1>
-
-                  <p className="mt-5 max-w-[650px] text-[16px] leading-7 text-[var(--muted)]">
-                    Choose the featured interest you connect with most. It&apos;s
-                    about finding common ground, never judging people.
-                  </p>
-                </div>
-              </section>
-
-              <section aria-live="polite">{renderDiscoveryContent()}</section>
-
-              {notice && (
-                <div className="mx-auto mt-6 max-w-[760px] rounded-2xl border border-[var(--line)] bg-[var(--mist)] px-4 py-3.5 text-center text-sm leading-6 text-[var(--muted)] animate-fade-up">
-                  {notice}
-                </div>
-              )}
-            </>
-          ) : (
-            <section className="animate-page-in">
-              <p className="mb-3 text-xs font-bold uppercase tracking-[0.18em] text-[var(--coral)]">
-                myFolks
-              </p>
-
-              <h1 className="text-[clamp(2.7rem,7vw,5rem)] font-extrabold leading-[0.94] tracking-[-0.06em] text-[var(--ink)]">
-                {activePage === "friends"
-                  ? "Your connections."
-                  : activePage === "messages"
-                    ? "Your conversations."
-                    : activePage === "create-profile"
-                      ? "Create your profile."
-                      : activePage === "profile"
-                        ? "Your profile."
-                        : "Your settings."}
-              </h1>
-
-              <p className="mt-5 max-w-[650px] text-[16px] leading-7 text-[var(--muted)]">
-                This part of myFolks will be connected to the production
-                experience next.
-              </p>
-
-              <button
-                type="button"
-                onClick={() => setActivePage("discover")}
-                className="mt-8 rounded-2xl bg-[var(--ink)] px-5 py-3.5 text-sm font-bold text-[var(--paper)] shadow-[0_8px_20px_rgba(37,33,31,0.10)] transition-all duration-300 hover:-translate-y-0.5 hover:shadow-[0_12px_28px_rgba(37,33,31,0.15)]"
-              >
-                Back to Discover
-              </button>
-            </section>
-          )}
         </div>
       </main>
+    );
+  }
 
-      <footer className="border-t border-[var(--line)] px-5 py-8 sm:px-8">
-        <div className="mx-auto flex max-w-[1180px] flex-col gap-3 text-center sm:flex-row sm:items-center sm:justify-between sm:text-left">
-          <p className="text-xs leading-5 text-[#938a83]">
-            myFolks is for finding common ground.
-          </p>
-
-          <p className="max-w-[520px] text-xs leading-5 text-[#938a83] sm:text-right">
-            Only share what you are comfortable making public. myFolks never
-            shows private interests, contact details, or exact locations in
-            Discover.
-          </p>
-        </div>
-      </footer>
-
-      {showIntro && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-[rgba(37,33,31,0.28)] px-5 py-8 backdrop-blur-sm animate-fade-up">
-          <div
-            role="dialog"
-            aria-modal="true"
-            aria-labelledby="discovery-intro-title"
-            className="w-full max-w-[500px] rounded-[30px] border border-[var(--line)] bg-[var(--paper)] p-7 shadow-[0_28px_80px_rgba(37,33,31,0.18)] sm:p-9"
+  return (
+    <div className="site-shell grain">
+      <header className="site-header">
+        <div className="header-inner">
+          <button
+            type="button"
+            className="brand-button"
+            onClick={() =>
+              setActiveView(
+                "discover",
+              )
+            }
           >
-            <div className="mb-7 flex h-14 w-14 items-center justify-center rounded-[18px] bg-[var(--lavender)] text-lg font-extrabold text-[var(--ink)]">
-              2
-            </div>
+            <span className="brand-symbol">
+              m
+            </span>
 
-            <p className="text-xs font-bold uppercase tracking-[0.18em] text-[var(--coral)]">
-              How Discover works
-            </p>
+            <span className="brand-name">
+              myFolks
+            </span>
+          </button>
 
-            <h2
-              id="discovery-intro-title"
-              className="mt-3 text-[clamp(2rem,6vw,3rem)] font-extrabold leading-[0.98] tracking-[-0.055em] text-[var(--ink)]"
+          <nav
+            className="site-nav"
+            aria-label="Main navigation"
+          >
+            <button
+              type="button"
+              className={`nav-link ${
+                activeView ===
+                "discover"
+                  ? "active"
+                  : ""
+              }`}
+              onClick={() =>
+                setActiveView(
+                  "discover",
+                )
+              }
             >
-              Find your people.
-            </h2>
-
-            <p className="mt-5 text-[15px] leading-7 text-[var(--muted)]">
-              You&apos;ll see two people at a time. Choose the interest that
-              feels more familiar to you. Your choice stays, while the other
-              person leaves and a new person appears.
-            </p>
-
-            <div className="mt-6 rounded-[22px] bg-[var(--mist)] p-5">
-              <p className="text-sm font-bold text-[var(--ink)]">
-                One person stays. One new person appears.
-              </p>
-
-              <p className="mt-2 text-sm leading-6 text-[var(--muted)]">
-                Keep choosing as long as you want. There&apos;s no final
-                perfect match — just people and interests worth discovering.
-              </p>
-            </div>
+              Discover
+            </button>
 
             <button
               type="button"
-              onClick={closeIntro}
-              className="mt-7 w-full rounded-2xl bg-[var(--ink)] px-5 py-3.5 text-sm font-bold text-[var(--paper)] shadow-[0_8px_20px_rgba(37,33,31,0.10)] transition-all duration-300 hover:-translate-y-0.5 hover:shadow-[0_12px_28px_rgba(37,33,31,0.15)]"
+              className={`nav-link ${
+                activeView ===
+                "profile"
+                  ? "active"
+                  : ""
+              }`}
+              onClick={() =>
+                setActiveView(
+                  "profile",
+                )
+              }
             >
-              Start discovering
+              My profile
             </button>
-          </div>
+          </nav>
         </div>
-      )}
-    </>
+      </header>
+
+      <main className="main-content">
+        {activeView ===
+        "profile" ? (
+          <section className="view-panel profile-view">
+            <div className="section-heading">
+              <p className="eyebrow">
+                Your profile
+              </p>
+
+              <h1>
+                Tell your folks a
+                little about you.
+              </h1>
+
+              <p>
+                Keep it simple. Your
+                profile helps myFolks
+                understand what you enjoy
+                and find meaningful common
+                ground.
+              </p>
+            </div>
+
+            <form
+              className="profile-form"
+              onSubmit={
+                saveProfile
+              }
+            >
+              <label className="form-field">
+                <span>
+                  Name <b>*</b>
+                </span>
+
+                <input
+                  type="text"
+                  value={
+                    profileForm.name
+                  }
+                  onChange={(event) =>
+                    updateProfileField(
+                      "name",
+                      event.target
+                        .value,
+                    )
+                  }
+                  placeholder="Your name"
+                  required
+                />
+              </label>
+
+              <label className="form-field">
+                <span>
+                  Bio
+                </span>
+
+                <textarea
+                  value={
+                    profileForm.bio
+                  }
+                  onChange={(event) =>
+                    updateProfileField(
+                      "bio",
+                      event.target
+                        .value,
+                    )
+                  }
+                  placeholder="A short line about you..."
+                  rows={4}
+                />
+              </label>
+
+              <label className="form-field">
+                <span>
+                  WhatsApp number{" "}
+                  <b>*</b>
+                </span>
+
+                <input
+                  type="tel"
+                  value={
+                    profileForm.whatsapp
+                  }
+                  onChange={(event) =>
+                    updateProfileField(
+                      "whatsapp",
+                      event.target
+                        .value,
+                    )
+                  }
+                  placeholder="077 123 4567"
+                  inputMode="tel"
+                  required
+                />
+
+                <small>
+                  Required so people can
+                  connect with you after
+                  finding common ground.
+                </small>
+              </label>
+
+              <label className="form-field">
+                <span>
+                  Facebook profile
+                </span>
+
+                <input
+                  type="url"
+                  value={
+                    profileForm.facebook
+                  }
+                  onChange={(event) =>
+                    updateProfileField(
+                      "facebook",
+                      event.target
+                        .value,
+                    )
+                  }
+                  placeholder="https://facebook.com/..."
+                />
+              </label>
+
+              <label className="form-field">
+                <span>
+                  Profile photo
+                </span>
+
+                <input
+                  type="file"
+                  accept="image/*"
+                  onChange={
+                    handleProfileImage
+                  }
+                />
+
+                {profileForm.profileImage && (
+                  <div className="profile-image-preview">
+                    <img
+                      src={
+                        profileForm.profileImage
+                      }
+                      alt="Profile preview"
+                    />
+                  </div>
+                )}
+              </label>
+
+              <div className="form-field">
+                <div className="field-heading">
+                  <span>
+                    Interests{" "}
+                    <b>*</b>
+                  </span>
+
+                  <small>
+                    {
+                      profileForm
+                        .interests
+                        .length
+                    }
+                    /8 selected
+                  </small>
+                </div>
+
+                <div className="interest-grid">
+                  {interests.map(
+                    (interest) => {
+                      const selected =
+                        profileForm.interests.includes(
+                          interest,
+                        );
+
+                      return (
+                        <button
+                          key={
+                            interest
+                          }
+                          type="button"
+                          className={`interest-chip ${
+                            selected
+                              ? "selected"
+                              : ""
+                          }`}
+                          onClick={() =>
+                            toggleInterest(
+                              interest,
+                            )
+                          }
+                        >
+                          {interest}
+                        </button>
+                      );
+                    },
+                  )}
+                </div>
+              </div>
+
+              {profileError && (
+                <div
+                  className="form-error"
+                  role="alert"
+                >
+                  {profileError}
+                </div>
+              )}
+
+              <button
+                type="submit"
+                className="primary-button"
+                disabled={
+                  savingProfile
+                }
+              >
+                {savingProfile
+                  ? "Saving..."
+                  : currentUser
+                    ? "Save profile"
+                    : "Create profile"}
+              </button>
+            </form>
+          </section>
+        ) : (
+          <section className="view-panel discovery-view">
+            {!currentUser ? (
+              <div className="empty-discovery">
+                <p className="eyebrow">
+                  Shared-interest
+                  discovery
+                </p>
+
+                <h1>
+                  First, tell us who
+                  you are.
+                </h1>
+
+                <p>
+                  Create your profile and
+                  choose a few things you
+                  genuinely enjoy. Then
+                  myFolks will guide you
+                  through six rounds of
+                  choices.
+                </p>
+
+                <button
+                  type="button"
+                  className="primary-button"
+                  onClick={() =>
+                    setActiveView(
+                      "profile",
+                    )
+                  }
+                >
+                  Create my profile
+                </button>
+              </div>
+            ) : result ? (
+              <div className="result-section">
+                <div className="result-card">
+                  <div className="result-spark">
+                    ✦
+                  </div>
+
+                  <p className="eyebrow">
+                    Six choices later
+                  </p>
+
+                  <h1>
+                    You found
+                    <br />
+                    common ground.
+                  </h1>
+
+                  <div className="result-person">
+                    <PersonAvatar
+                      person={
+                        result.person
+                      }
+                      large
+                    />
+
+                    <div>
+                      <h2>
+                        {
+                          result.person
+                            .name
+                        }
+                      </h2>
+
+                      <span>
+                        myFolks member
+                      </span>
+                    </div>
+                  </div>
+
+                  {result.person
+                    .bio && (
+                    <p className="result-bio">
+                      {
+                        result
+                          .person
+                          .bio
+                      }
+                    </p>
+                  )}
+
+                  <div className="result-explanation">
+                    <span>
+                      WHAT YOU HAVE
+                      IN COMMON
+                    </span>
+
+                    {result
+                      .sharedInterests
+                      .length >
+                    0 ? (
+                      <>
+                        <div className="result-tags">
+                          {result.sharedInterests.map(
+                            (
+                              interest,
+                            ) => (
+                              <span
+                                key={
+                                  interest
+                                }
+                              >
+                                {
+                                  interest
+                                }
+                              </span>
+                            ),
+                          )}
+                        </div>
+
+                        <p>
+                          Your choices kept
+                          pointing toward
+                          similar interests,
+                          especially{" "}
+                          <strong>
+                            {result.sharedInterests
+                              .slice(
+                                0,
+                                2,
+                              )
+                              .join(
+                                " and ",
+                              )}
+                          </strong>
+                          .
+                        </p>
+                      </>
+                    ) : (
+                      <p>
+                        Your six choices
+                        showed a similar
+                        pattern across
+                        several areas of
+                        interest.
+                      </p>
+                    )}
+                  </div>
+
+                  <div className="result-actions">
+                    {whatsappLink ? (
+                      <a
+                        href={
+                          whatsappLink
+                        }
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="primary-button"
+                      >
+                        Message on
+                        WhatsApp
+                      </a>
+                    ) : (
+                      <div className="connection-warning">
+                        This person hasn't
+                        added a valid WhatsApp
+                        number yet.
+                      </div>
+                    )}
+
+                    {result.person
+                      .facebook && (
+                      <a
+                        href={
+                          result
+                            .person
+                            .facebook
+                        }
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="secondary-button"
+                      >
+                        View Facebook
+                      </a>
+                    )}
+                  </div>
+
+                  <button
+                    type="button"
+                    className="text-button"
+                    onClick={
+                      resetDiscovery
+                    }
+                  >
+                    Discover again
+                  </button>
+                </div>
+              </div>
+            ) : (
+              <>
+                <div className="section-heading discovery-heading">
+                  <p className="eyebrow">
+                    Shared-interest
+                    discovery
+                  </p>
+
+                  <h1>
+                    Which interest
+                    feels familiar?
+                  </h1>
+
+                  <p>
+                    Choose the person whose
+                    interests feel more like
+                    you. We'll use six rounds
+                    to understand the pattern
+                    behind your choices.
+                  </p>
+                </div>
+
+                <div className="session-card">
+                  <div className="session-card-heading">
+                    <span>
+                      Discovery session
+                    </span>
+
+                    <strong>
+                      Round{" "}
+                      {Math.min(
+                        round + 1,
+                        TOTAL_ROUNDS,
+                      )}{" "}
+                      of{" "}
+                      {TOTAL_ROUNDS}
+                    </strong>
+                  </div>
+
+                  <div className="progress-track">
+                    <div
+                      className="progress-fill"
+                      style={{
+                        width: `${progress}%`,
+                      }}
+                    />
+                  </div>
+                </div>
+
+                {discoveryError && (
+                  <div
+                    className="form-error"
+                    role="alert"
+                  >
+                    {
+                      discoveryError
+                    }
+                  </div>
+                )}
+
+                {loadingProfiles ? (
+                  <div className="discovery-loading">
+                    <div className="loading-dot" />
+                    Loading your folks...
+                  </div>
+                ) : currentRound ? (
+                  <div className="pair-section">
+                    <div className="pair-grid">
+                      <PersonCard
+                        person={
+                          currentRound.left
+                        }
+                        onChoose={
+                          choosePerson
+                        }
+                      />
+
+                      <div className="or-divider">
+                        <span>
+                          OR
+                        </span>
+                      </div>
+
+                      <PersonCard
+                        person={
+                          currentRound.right
+                        }
+                        onChoose={
+                          choosePerson
+                        }
+                      />
+                    </div>
+                  </div>
+                ) : (
+                  <div className="empty-discovery">
+                    <p>
+                      Create at least two
+                      other profiles before
+                      starting discovery.
+                    </p>
+
+                    <button
+                      type="button"
+                      className="primary-button"
+                      onClick={() =>
+                        setActiveView(
+                          "profile",
+                        )
+                      }
+                    >
+                      View my profile
+                    </button>
+                  </div>
+                )}
+              </>
+            )}
+          </section>
+        )}
+      </main>
+
+      <footer className="site-footer">
+        <div>
+          <strong>myFolks</strong>
+
+          <span>
+            Find your people. Find common
+            ground.
+          </span>
+        </div>
+      </footer>
+    </div>
   );
 }

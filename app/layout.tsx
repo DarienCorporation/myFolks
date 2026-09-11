@@ -5,13 +5,12 @@ import "./globals.css";
 const workSans = Work_Sans({
   variable: "--font-work-sans",
   subsets: ["latin"],
-  weight: ["400", "500", "600", "700", "800"],
+  display: "swap",
 });
 
 export const metadata: Metadata = {
   title: "myFolks — Find common ground",
-  description:
-    "Discover people through shared interests and find common ground.",
+  description: "Find your people. Find common ground.",
 };
 
 export default function RootLayout({
